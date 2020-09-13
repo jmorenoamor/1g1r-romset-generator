@@ -178,18 +178,26 @@ class Rule:
             return self.__byteswap
         if name == 'wordswap':
             return self.__wordswap
+        if name == 'wordbyteswap':
+            return self.__wordbyteswap
         if name == 'none':
             return self.__none
         raise ValueError('Unknown operation: %s' % name)
 
     def __bitswap(self, byte_arr: bytes) -> bytes:
-        return self.__none(byte_arr)[::-1]
+        return bytes([
+            int(bin(x << 24)[2::][::-1], 2) & 0xFF
+            for x in self.__none(byte_arr)])
 
     def __wordswap(self, byte_arr: bytes) -> bytes:
         return Rule.__invert_bytes(self.__none(byte_arr), 4)
 
     def __byteswap(self, byte_arr: bytes) -> bytes:
         return Rule.__invert_bytes(self.__none(byte_arr), 2)
+
+    def __wordbyteswap(self, byte_arr: bytes) -> bytes:
+        word_swapped = Rule.__invert_bytes(self.__none(byte_arr), 4)
+        return Rule.__invert_bytes(word_swapped, 2)
 
     def __none(self, byte_arr: bytes) -> bytes:
         if self.__end_offset == 0:
@@ -200,8 +208,8 @@ class Rule:
     @staticmethod
     def __invert_bytes(byte_arr: bytes, chunk_size: int) -> bytes:
         result = []
-        for i in range(len(byte_arr), 0, -chunk_size):
-            result.extend(byte_arr[i - chunk_size:i])
+        for i in range(0, len(byte_arr), chunk_size):
+            result.extend(byte_arr[i:i + chunk_size][::-1])
         return bytes(result)
 
 
@@ -226,14 +234,14 @@ def parse_rules(file: Path) -> List[Rule]:
                     tests.append(Rule.DataTest(
                         test.get('value'),
                         test.get('offset'),
-                        test.get('rules')))
+                        test.get('result')))
                 elif test.tag in ('and', 'or', 'xor'):
                     tests.append(Rule.BooleanTest(
                         test.tag,
                         test.get('mask'),
                         test.get('value'),
                         test.get('offset'),
-                        test.get('rules')))
+                        test.get('result')))
                 elif test.tag == 'file':
                     tests.append(Rule.FileTest(
                         test.get('size'),

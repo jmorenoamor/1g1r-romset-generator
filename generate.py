@@ -9,8 +9,8 @@ from io import BufferedIOBase
 from pathlib import Path
 from threading import current_thread
 from typing import Optional, Match, List, Dict, Pattern, Callable, Union, \
-    BinaryIO, TextIO
-from zipfile import ZipFile, BadZipFile, ZipInfo
+    TextIO, IO
+from zipfile import ZipFile, ZipInfo, is_zipfile
 
 from modules import datafile, header
 from modules.classes import GameEntry, Score, RegionData, \
@@ -20,7 +20,7 @@ from modules.header import Rule
 from modules.utils import get_index, check_in_pattern_list, to_int_list, \
     add_padding, get_or_default, available_columns, trim_to, is_valid
 
-__version__ = '1.9.4-SNAPSHOT'
+__version__ = '1.9.10-SNAPSHOT'
 
 PROGRESSBAR: Optional[MultiThreadedProgressBar] = None
 
@@ -95,6 +95,7 @@ VERSION_REGEX = re.compile(r'\(v\s*([a-z0-9.]+)\)', re.IGNORECASE)
 LANGUAGES_REGEX = re.compile(r'\(([a-z]{2}(?:[,+][a-z]{2})*)\)', re.IGNORECASE)
 BAD_REGEX = re.compile(re.escape('[b]'), re.IGNORECASE)
 ZIP_REGEX = re.compile(r'\.zip$', re.IGNORECASE)
+ALPHABETICAL_REGEX = re.compile(r'^[a-z]', re.IGNORECASE)
 
 
 def parse_revision(name: str) -> str:
@@ -333,7 +334,7 @@ def index_files(
                 '%s%s\033[K' % (
                     FOUND_PREFIX,
                     trim_to(
-                        file_relative_to_input(full_path, input_dir),
+                        full_path.relative_to(input_dir),
                         available_columns(FOUND_PREFIX) - 2)),
                 end='\r',
                 file=sys.stderr)
@@ -365,7 +366,7 @@ def index_files(
                     next_file = shared_files_data.pop(0)
                     PROGRESSBAR.print_thread(
                         curr_thread.index,
-                        file_relative_to_input(next_file.path, input_dir))
+                        next_file.path.relative_to(input_dir))
                     shared_result_data.append(process_file(
                         next_file,
                         also_check_archive))
@@ -392,7 +393,8 @@ def index_files(
 
         for intermediate_result in intermediate_results:
             for key, value in intermediate_result.items():
-                if key in result and not is_zip(result[key]):
+                if key in result and not \
+                        (result[key] and is_zipfile(result[key])):
                     result[key] = value
     return result
 
@@ -411,13 +413,14 @@ def get_header_rules(root: datafile) -> List[Rule]:
                 return []
 
 
+# noinspection PyBroadException
 def process_file(
         file_data: FileData,
         also_check_archive: bool) -> Dict[str, Path]:
     full_path = file_data.path
     result: Dict[str, Path] = {}
-    is_zip_file = is_zip(full_path)
-    if is_zip_file:
+    is_zip = is_zipfile(full_path)
+    if is_zip:
         try:
             with ZipFile(full_path) as compressed_file:
                 infos: List[ZipInfo] = compressed_file.infolist()
@@ -433,11 +436,11 @@ def process_file(
                                 % (
                                     "%s:%s" % (full_path, file_info.filename),
                                     digest))
-        except BadZipFile as e:
+        except Exception as e:
             print(
                 'Error while reading file [%s]: %s\033[K' % (full_path, e),
                 file=sys.stderr)
-    if not is_zip_file or also_check_archive:
+    if not is_zip or also_check_archive:
         try:
             file_size: int = full_path.stat().st_size
             with full_path.open('rb') as uncompressed_file:
@@ -445,9 +448,10 @@ def process_file(
                 if DEBUG:
                     log("DEBUG: Scan result for file [%s]: %s"
                         % (full_path, digest))
-                if digest not in result or is_zip(result[digest]):
+                if digest not in result or \
+                        (result[digest] and is_zipfile(result[digest])):
                     result[digest] = full_path
-        except IOError as e:
+        except Exception as e:
             print(
                 'Error while reading file: %s\033[K' % e,
                 file=sys.stderr)
@@ -456,7 +460,7 @@ def process_file(
 
 def compute_hash(
         file_size: int,
-        internal_file: Union[BufferedIOBase, BinaryIO]) -> str:
+        internal_file: Union[BufferedIOBase, IO[bytes]]) -> str:
     hasher = hashlib.sha1()
     if RULES and file_size <= MAX_FILE_SIZE:
         file_bytes = internal_file.read()
@@ -471,10 +475,6 @@ def compute_hash(
                 break
             hasher.update(chunk)
     return hasher.hexdigest().lower()
-
-
-def is_zip(file: Path) -> bool:
-    return file and bool(ZIP_REGEX.search(file.name))
 
 
 def main(argv: List[str]):
@@ -523,7 +523,8 @@ def main(argv: List[str]):
             'header-file=',
             'max-file-size=',
             'version',
-            'only-selected-lang'
+            'only-selected-lang',
+            'group-by-first-letter'
         ])
     except getopt.GetoptError as e:
         sys.exit(help_msg(e))
@@ -562,6 +563,7 @@ def main(argv: List[str]):
     prioritize_languages = False
     prefer_parents = False
     prefer_prereleases = False
+    group_by_first_letter = False
     language_weight = 3
     move = False
     global THREADS
@@ -654,6 +656,7 @@ def main(argv: List[str]):
             RULES = header.parse_rules(header_file)
         if opt == '--max-file-size':
             MAX_FILE_SIZE = int(arg)
+        group_by_first_letter |= opt == '--group-by-first-letter'
 
     if not no_scan and not input_dir:
         print(
@@ -693,6 +696,8 @@ def main(argv: List[str]):
     if all_regions and all_regions_with_lang:
         sys.exit(help_msg(
             'all-regions is mutually exclusive with all-regions-with-lang'))
+    if group_by_first_letter and not output_dir:
+        sys.exit(help_msg('group-by-first-letter requires an output directory'))
     if THREADS <= 0:
         sys.exit(help_msg('Number of threads should be > 0'))
     if MAX_FILE_SIZE <= 0:
@@ -863,10 +868,16 @@ def main(argv: List[str]):
                 'DEBUG: Candidates for game [%s] after filtering: %s'
                 % (game, JSON_ENCODER.encode(entries)))
         size = len(entries)
+        curr_out_dir = output_dir
         for i in range(0, size):
             entry = entries[i]
             if check_in_pattern_list(entry.name, exclude_after):
                 break
+            if output_dir and group_by_first_letter:
+                curr_out_dir = output_dir / \
+                               (entry.name[0].lower()
+                                if ALPHABETICAL_REGEX.search(entry.name)
+                                else '#')
             if use_hashes:
                 copied_files = set()
                 num_roms = len(entry.roms)
@@ -874,22 +885,21 @@ def main(argv: List[str]):
                     digest = entry_rom.sha1.lower()
                     rom_input_path = hash_index[digest]
                     if rom_input_path:
-                        is_zip_file = is_zip(rom_input_path)
-                        file = file_relative_to_input(rom_input_path, input_dir)
-                        if not output_dir:
+                        is_zip = is_zipfile(rom_input_path)
+                        file = rom_input_path.relative_to(input_dir)
+                        if not curr_out_dir:
                             if rom_input_path not in copied_files:
-                                printed_items.append(file)
+                                printed_items.append(str(file))
                                 copied_files.add(rom_input_path)
                         elif rom_input_path not in copied_files:
-                            if not is_zip_file \
-                                    and (num_roms > 1 or '/' in file):
-                                rom_output_dir = output_dir / entry.name
-                                rom_output_dir.mkdir(
-                                    parents=True,
-                                    exist_ok=True)
+                            if not is_zip and num_roms > 1:
+                                rom_output_dir = curr_out_dir / entry.name
                             else:
-                                rom_output_dir = output_dir
-                            if is_zip_file:
+                                rom_output_dir = curr_out_dir
+                            rom_output_dir.mkdir(
+                                parents=True,
+                                exist_ok=True)
+                            if is_zip:
                                 zip_name = add_extension(entry.name, 'zip')
                                 rom_output_path = rom_output_dir / zip_name
                             else:
@@ -918,8 +928,9 @@ def main(argv: List[str]):
                 file_name = add_extension(entry.name, file_extension)
                 full_path = input_dir / file_name
                 if full_path.is_file():
-                    if output_dir:
-                        transfer_file(full_path, output_dir, move)
+                    if curr_out_dir:
+                        curr_out_dir.mkdir(parents=True, exist_ok=True)
+                        transfer_file(full_path, curr_out_dir, move)
                     else:
                         printed_items.append(file_name)
                     break
@@ -927,8 +938,8 @@ def main(argv: List[str]):
                     for entry_rom in entry.roms:
                         rom_input_path = full_path / entry_rom.name
                         if rom_input_path.is_file():
-                            if output_dir:
-                                rom_output_dir = output_dir / file_name
+                            if curr_out_dir:
+                                rom_output_dir = curr_out_dir / file_name
                                 rom_output_dir.mkdir(
                                     parents=True,
                                     exist_ok=True)
@@ -967,10 +978,6 @@ def add_extension(file_name: str, file_extension: str) -> str:
     if file_extension:
         return file_name + '.' + file_extension
     return file_name
-
-
-def file_relative_to_input(file: Path, input_dir: Path) -> str:
-    return str(file).replace(str(input_dir), '', 1).lstrip('/')
 
 
 def parse_list(
@@ -1086,6 +1093,10 @@ def help_msg(s: Optional[Union[str, Exception]] = None) -> str:
         '\t--move\t\t\t'
         'If set, ROMs will be moved, instead of copied, '
         'to the output directory',
+
+        '\t--group-by-first-letter\t'
+        'If set, groups ROMs on the output directory in subfolders according '
+        'to the first letter in their name',
 
         '\n# File scanning:',
 
